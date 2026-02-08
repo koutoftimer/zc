@@ -9,11 +9,12 @@
 
 int indentation_level     = 1;
 constexpr int indentation = 4;
+int line_number           = 1;
 
 bool
 output_escaped(char const* start, char const* end, struct StringBuilder* sb)
 {
-#define output(...)                                    \
+#define OUTPUT(...)                                    \
         do {                                           \
                 bool ok = sb_appendf(sb, __VA_ARGS__); \
                 if (!ok) return false;                 \
@@ -22,36 +23,36 @@ output_escaped(char const* start, char const* end, struct StringBuilder* sb)
         for (auto p = start; p < end; ++p) {
                 switch (*p) {
                 case '\"':
-                        output("%s", "\\\"");
+                        OUTPUT("%s", "\\\"");
                         break;
                 case '\\':
-                        output("%s", "\\\\");
+                        OUTPUT("%s", "\\\\");
                         break;
                 case '\n': {
                         // combine newlines on single output line
                         for (; p < end && *p == '\n'; ++p) {
-                                output("%s", "\\n");
+                                OUTPUT("%s", "\\n");
                         }
                         if (p >= end || *p == '\0') break;
                         --p;
 
                         // split multi-line string
                         constexpr int quotes_index = sizeof("sb_appendf(sb,");
-                        output("\"\n%*s\"",
+                        OUTPUT("\"\n%*s\"",
                                indentation_level * indentation + quotes_index,
                                "");
                 } break;
                 case '\r':
-                        output("%s", "\\r");
+                        OUTPUT("%s", "\\r");
                         break;
                 default:
-                        output("%c", *p);
+                        OUTPUT("%c", *p);
                 }
         }
 
         return true;
 
-#undef output
+#undef OUTPUT
 }
 
 char*
@@ -86,69 +87,77 @@ build_header_guard(char const* filename)
 }
 
 int
+count_char(struct String s, char target)
+{
+        int count = 0;
+        for (size_t i = 0; i < s.size; i++) {
+                if (s.data[i] == target) {
+                        count++;
+                }
+        }
+        return count;
+}
+
+int
 translate(const char* const filename)
 {
-        auto content = read_entire_file(filename);
+        bool ok;
+        struct StringBuilder sb = {0};
+
+        struct String content   = read_entire_file(filename);
         if (!content.data) {
                 perror("Could not read input file/stream");
                 return EXIT_FAILURE;
         }
-        char const* const src = content.data;
-        struct String guard   = build_header_guard(filename);
+        struct String guard = build_header_guard(filename);
         if (!guard.data) {
                 perror("Could not build header file guard");
                 return EXIT_FAILURE;
         }
 
-        struct StringBuilder sb = {0};
-
-#define output(...)                                     \
-        do {                                            \
-                bool ok = sb_appendf(&sb, __VA_ARGS__); \
-                if (!ok) {                              \
-                        free(guard.data);               \
-                        free(sb.ascii.data);            \
-                        free(content.data);             \
-                        return EXIT_FAILURE;            \
-                }                                       \
+#define OUTPUT(...)                                \
+        do {                                       \
+                ok = sb_appendf(&sb, __VA_ARGS__); \
+                if (!ok) goto cleanup;             \
         } while (0)
+#define OUTPUT_LINE OUTPUT("#line %d \"%s\"\n", line_number, filename)
 
-#define output_escaped(...)                            \
+#define OUTPUT_ESCAPED(...)                            \
         do {                                           \
-                bool ok = output_escaped(__VA_ARGS__); \
-                if (!ok) {                             \
-                        free(guard.data);              \
-                        free(sb.ascii.data);           \
-                        free(content.data);            \
-                        return EXIT_FAILURE;           \
-                }                                      \
+                ok = output_escaped(__VA_ARGS__, &sb); \
+                if (!ok) goto cleanup;                 \
         } while (0)
 
         // Header Guard
-        output("#ifndef %s_H\n#define %s_H\n\n", guard.data, guard.data);
-        output("%s",
+        OUTPUT("#ifndef %s_H\n#define %s_H\n\n", guard.data, guard.data);
+        OUTPUT("%s",
                "bool render_template("
                "struct Context* ctx, struct StringBuilder* sb);\n\n");
-        output("%s", "#endif\n\n#ifdef IMPLEMENTATION\n\n");
-        output("%s", "#define $ (*ctx)\n");
-        output("%s",
+        OUTPUT("%s", "#endif\n\n#ifdef IMPLEMENTATION\n\n");
+        OUTPUT("%s", "#define $ (*ctx)\n");
+        OUTPUT("%s",
                "#define sb_appendf(...) do { "
                "bool res = sb_appendf(__VA_ARGS__); if (!res) return false; "
                "} while(0)\n\n");
-        output("%s",
+        OUTPUT("%s",
                "bool\nrender_template("
                "struct Context* ctx, struct StringBuilder* sb)\n{\n");
 
-        char const* cursor = src;
+        char const* cursor = content.data;
+        struct String text = {
+            .const_data = content.data,
+            .size       = 0,
+        };
         while (*cursor) {
-                char* tag_open = strstr(cursor, "{{");
+                char const* tag_open = strstr(cursor, "{{");
 
                 if (!tag_open) {
                         // Remainder of file
-                        output("%*ssb_appendf(sb, \"",
+                        OUTPUT_LINE;
+                        OUTPUT("%*ssb_appendf(sb, \"",
                                indentation_level * indentation, "");
-                        output_escaped(cursor, cursor + strlen(cursor), &sb);
-                        output("%s", "\");\n");
+                        OUTPUT_ESCAPED(cursor, cursor + strlen(cursor));
+                        OUTPUT("%s", "\");\n");
                         break;
                 }
 
@@ -160,25 +169,23 @@ translate(const char* const filename)
                 }
 
                 // 2. Parse Tag
-                char* tag_contents = tag_open + 2;
-                char* tag_close    = strstr(tag_contents, "}}");
+                char const* tag_contents = tag_open + 2;
+                char const* tag_close    = strstr(tag_contents, "}}");
 
                 if (!tag_close) {
                         int starting_line = 1;
-                        for (auto it = src; it < tag_open; ++it) {
+                        for (auto it = content.data; it < tag_open; ++it) {
                                 starting_line += *it == '\n';
                         }
                         fprintf(stderr,
                                 "ERROR: Template statement has unmatched "
                                 "parentecies\n%s:%d:\n",
                                 filename, starting_line);
-                        auto tail_len = strlen(tag_open);
+                        int tail_len = strlen(tag_open);
                         if (tail_len > 40) tail_len = 40;
-                        tag_open[tail_len] = '\0';
-                        fprintf(stderr, "%s", tag_open);
-                        free(sb.ascii.data);
-                        free(content.data);
-                        return EXIT_FAILURE;
+                        fprintf(stderr, "%.*s\n", tail_len, tag_open);
+                        ok = false;
+                        goto cleanup;
                 }
 
                 bool line_elimination =
@@ -215,23 +222,30 @@ translate(const char* const filename)
 
                 // Output text before tag
                 if (text_before_tag.size) {
-                        output("%*ssb_appendf(sb, \"",
+                        OUTPUT_LINE;
+                        text.size = tag_open - text.const_data;
+                        line_number += count_char(text, '\n');
+                        OUTPUT("%*ssb_appendf(sb, \"",
                                indentation_level * indentation, "");
-                        output_escaped(
+                        OUTPUT_ESCAPED(
                             text_before_tag.data,
-                            text_before_tag.data + text_before_tag.size, &sb);
-                        output("%s", "\");\n");
+                            text_before_tag.data + text_before_tag.size);
+                        OUTPUT("%s", "\");\n");
                 }
+
+                text.const_data       = tag_close;
 
                 // Output tag body
                 size_t const code_len = strlen(code);
                 if (strncmp(code, "$.", 2) == 0) {
                         // String Mode shortcut
-                        output("%*ssb_appendf(sb, \"%%s\", %s);\n",
+                        OUTPUT_LINE;
+                        OUTPUT("%*ssb_appendf(sb, \"%%s\", %s);\n",
                                indentation_level * indentation, "", code);
                 } else if (code[0] == '\"') {
                         // Format Mode shortcut
-                        output("%*ssb_appendf(sb, %s);\n",
+                        OUTPUT_LINE;
+                        OUTPUT("%*ssb_appendf(sb, %s);\n",
                                indentation_level * indentation, "", code);
                 } else if (code_len) {
                         // Raw Mode (C code)
@@ -243,7 +257,8 @@ translate(const char* const filename)
                         }
                         // decrease indentation before tag's body
                         if (brackets < 0) indentation_level += brackets;
-                        output("%*s%s\n", indentation_level * indentation, "",
+                        OUTPUT_LINE;
+                        OUTPUT("%*s%s\n", indentation_level * indentation, "",
                                code);
                         // increase indentation after tag's body
                         if (brackets > 0) indentation_level += brackets;
@@ -251,18 +266,19 @@ translate(const char* const filename)
                 free(raw_content);
         }
 
-        output("%s", "    return true;\n");
-        output("%s", "}\n\n#undef sb_appendf\n#undef $\n#endif\n");
+        OUTPUT("%s", "    return true;\n");
+        OUTPUT("%s", "}\n\n#undef sb_appendf\n#undef $\n#endif\n");
 
         printf("%s", sb.ascii.data);
 
+cleanup:
         free(guard.data);
         free(sb.ascii.data);
         free(content.data);
-        return EXIT_SUCCESS;
+        return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 
-#undef output
-#undef output_escaped
+#undef OUTPUT
+#undef OUTPUT_ESCAPED
 }
 
 int

@@ -9,7 +9,10 @@ struct BinaryString {
 };
 
 struct String {
-        char* data;
+        union {
+                char* data;
+                char const* const_data;
+        };
         size_t size;
 };
 

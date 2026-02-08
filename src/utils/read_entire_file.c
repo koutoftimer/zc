@@ -27,5 +27,5 @@ read_entire_file(char const* filename)
                 return (struct String){0};
         }
         buf[n] = '\0';
-        return (struct String){buf, n};
+        return (struct String){.data = buf, .size = n};
 }
